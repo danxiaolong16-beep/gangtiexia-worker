@@ -1,5 +1,7 @@
 from flask import Flask, jsonify, request, g
-import os, re, time, datetime, collections
+import os, re, time, datetime, collections, ipaddress, socket
+import urllib.request, urllib.error
+from urllib.parse import urlparse
 
 app = Flask(__name__)
 
@@ -95,6 +97,79 @@ def health():
 def run():
     # 这里以后接真正的分担任务：比如拉 GitHub 更新、跑个小爬虫测试
     return jsonify({"ok": True, "job": "test-run", "result": "hello from free server"})
+
+
+# ---------- HTTP 中转 /relay（只转公开网址，不做 VPN/隧道） ----------
+# 用途：VM 里的浏览器出不了网，Render 能正常出网，所以让 Render 代抓
+# 公开网页/API（比如 X 新闻榜单的镜像站、GitHub API），结果原样返回。
+# 安全边界（对应刚学完的 SSRF 防法）：
+#   * 只允许白名单里的公开 host，别的域名一律 403；
+#   * 只允许 https，http 一律拒绝；
+#   * 发请求前先解析域名，解析到内网/保留地址（127/10/172.16/192.168/
+#     169.254 云元数据等）一律拒绝，防 SSRF 打内网；
+#   * 只做 GET，超时 20 秒，正文最多 1MB，超了截断并标注；
+#   * 可选口令：Render 里设置了 RELAY_TOKEN 环境变量后，调用必须带
+#     X-Relay-Token 请求头；没设时只靠白名单（任何人都能转白名单站，
+#     滥用价值很低，但建议还是设一个口令）。
+#   * 每次调用都记一条 relay 记录，可在 /watchdog 里看到。
+RELAY_ALLOWED_HOSTS = {
+    "www.neteye.dev", "neteye.dev",          # X 热榜镜像站（X 新闻动态供料用）
+    "whatstrends.com", "www.whatstrends.com",  # X 热榜镜像站（备用）
+    "api.github.com", "raw.githubusercontent.com",  # GitHub API / 原始文件
+}
+RELAY_TIMEOUT_SECS = 20
+RELAY_MAX_BYTES = 1_000_000
+
+
+def _relay_reject(reason):
+    _alert(g.ip, "relay-rejected", reason[:200])
+    return jsonify({"ok": False, "error": reason}), 403
+
+
+@app.route("/relay", methods=["POST"])
+def relay():
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
+    token = os.environ.get("RELAY_TOKEN", "")
+    if token and request.headers.get("X-Relay-Token", "") != token:
+        return _relay_reject("missing or wrong X-Relay-Token")
+    if not url:
+        return jsonify({"ok": False, "error": "need JSON {\"url\": \"https://...\"}"}), 400
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return _relay_reject("bad url")
+    if parsed.scheme != "https" or not parsed.hostname:
+        return _relay_reject("only https URLs are allowed")
+    host = parsed.hostname.lower()
+    if host not in RELAY_ALLOWED_HOSTS:
+        return _relay_reject(f"host not in relay allowlist: {host}")
+    try:
+        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+    except Exception:
+        return _relay_reject(f"cannot resolve host: {host}")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local \
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+            return _relay_reject(f"host resolves to non-public IP: {ip}")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "gangtiexia-worker-relay/1.0"})
+        with urllib.request.urlopen(req, timeout=RELAY_TIMEOUT_SECS) as resp:
+            raw = resp.read(RELAY_MAX_BYTES + 1)
+            charset = resp.headers.get_content_charset() or "utf-8"
+            truncated = len(raw) > RELAY_MAX_BYTES
+            text = raw[:RELAY_MAX_BYTES].decode(charset, errors="replace")
+            status = resp.status
+            content_type = resp.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as e:
+        return jsonify({"ok": False, "error": f"upstream HTTP {e.code}"}), 502
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"fetch failed: {type(e).__name__}"}), 502
+    _alert(g.ip, "relay", f"fetched {url[:150]} -> {status}, truncated={truncated}")
+    return jsonify({"ok": True, "url": url, "status": status,
+                    "content_type": content_type, "truncated": truncated,
+                    "text": text})
 
 
 @app.route("/watchdog")
